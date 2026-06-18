@@ -69,7 +69,7 @@ my_bp_method = "ms"
 my_max_iter = 10000
 my_osd_method = "osd_cs"
 my_osd_order = 7
-my_ms_scaling_factor = 0
+my_ms_scaling_factor = 1.0
 
 
 
@@ -344,7 +344,7 @@ bpdZ=bposd_decoder(
     max_iter=my_max_iter, #the maximum number of iterations for BP)
     bp_method=my_bp_method,
     ms_scaling_factor=my_ms_scaling_factor, #min sum scaling factor. If set to zero the variable scaling factor method is used
-    osd_method="osd_cs", #the OSD method. Choose from:  1) "osd_e", "osd_cs", "osd0"
+    osd_method=my_osd_method, #the OSD method. Choose from:  1) "osd_e", "osd_cs", "osd0"
     osd_order=my_osd_order #the osd search depth
     )
 
