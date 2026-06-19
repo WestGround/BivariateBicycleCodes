@@ -350,15 +350,17 @@ def run_monte_carlo(data: DecoderData, num_trials: int, batch_size: int, seed: i
                 guessed_z = logical_from_recovery(data.logical_map_z, recovery_z)
                 if not np.array_equal(guessed_z, actual_z[i]):
                     failures += 1
+                    completed += 1
+                    progress.update(1)
+                    progress.set_postfix(failures=failures, refresh=False)
                     continue
                 recovery_x = decoder_x.decode(syndrome_x[i])
                 guessed_x = logical_from_recovery(data.logical_map_x, recovery_x)
                 if not np.array_equal(guessed_x, actual_x[i]):
                     failures += 1
-
-            completed += current
-            progress.update(current)
-            progress.set_postfix(failures=failures, refresh=False)
+                completed += 1
+                progress.update(1)
+                progress.set_postfix(failures=failures, refresh=False)
     finally:
         progress.close()
     print("<<< Finish Monte-Carlo\n")
