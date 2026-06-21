@@ -183,6 +183,7 @@ def run_monte_carlo(
     failures = 0
     completed = 0
     progress = tqdm(total=num_trials, unit="trial", disable=not online.progress)
+    progress.set_postfix(failures=failures, refresh=True)
     try:
         while completed < num_trials:
             current = min(batch_size, num_trials - completed)
@@ -200,7 +201,9 @@ def run_monte_carlo(
                     failed = not np.array_equal(guessed_x, actual_x[i])
                 if failed:
                     failures += 1
-                    progress.set_postfix(failures=failures, refresh=False)
+                    # Failures are rare, so force an immediate redraw when one
+                    # occurs instead of waiting for tqdm's next timed refresh.
+                    progress.set_postfix(failures=failures, refresh=True)
                 completed += 1
                 progress.update(1)
     finally:
