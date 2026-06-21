@@ -23,6 +23,38 @@ Each trial runs the noisy error correction circuit followed by a noiseless syndr
 distance_test.py calculates the code distance by solving an integer linear program
 
 
+## Stim-backed implementation
+
+The maintained implementation is split into:
+
+* `config.py`: code, circuit-noise, BP-OSD, and Monte Carlo parameters.
+* `decoder_offline.py`: constructs the effective BP-OSD noise model and saves a
+  detector-annotated Stim circuit in the decoder pickle.
+* `stim_backend.py`: translates the scheduled BB syndrome-extraction cycle into
+  Stim operations (`TICK`, noise channels, and `DETECTOR`) and samples it using
+  `stim.FlipSimulator`.
+* `decoder_online.py`: obtains detector events and final X/Z Pauli frames from
+  Stim, then performs BP-OSD decoding using `ldpc.BpOsdDecoder`.
+
+Run the offline step once and then run Monte Carlo sampling:
+
+```powershell
+python -B decoder_offline.py
+python -B decoder_online.py
+```
+
+The generated Stim circuit can be inspected independently:
+
+```powershell
+python -B decoder_online.py --trials 1 --write-stim-circuit bb_memory.stim
+```
+
+Each cycle records Z-check detector events first and X-check detector events
+second. The two anti-commuting classes of logical error are evaluated from the
+final X/Z Pauli frame instead of simultaneously measuring logical X and Z in
+the circuit.
+
+
 [BCGMRY]
 Sergey Bravyi, Andrew Cross, Jay Gambetta, Dmitri Maslov, Patrick Rall, Theodore Yoder,
 High-threshold and low-overhead fault-tolerant quantum memory

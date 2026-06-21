@@ -26,6 +26,7 @@ from tqdm import tqdm
 
 from config import BBParameters, NoiseParameters
 from config import code_param, sched_x, sched_z, N_c, error_rate, noise
+from stim_backend import build_stim_circuit
 
 
 Gate = tuple
@@ -346,7 +347,7 @@ def build_decoder_data(
     sched_x: Sequence[int | str],
     sched_z: Sequence[int | str],
 ) -> dict:
-    _, _, code, a_terms, b_terms, k = build_code(params)
+    hx, hz, code, a_terms, b_terms, k = build_code(params)
     n2 = params.ell * params.m
     tanner_x, tanner_z = build_tanner_graph(a_terms, b_terms)
     cycle, lin_order, data, xchecks, zchecks = build_cycle(
@@ -362,6 +363,18 @@ def build_decoder_data(
     )
     hz_aug, hdec_z, prob_z, first_z = effective_noise_model(
         "Z", cycle_i, num_cycles, n2, lx, data_indices, noise_params
+    )
+    stim_data = build_stim_circuit(
+        cycle=cycle,
+        lin_order=lin_order,
+        data_qubits=data,
+        xchecks=xchecks,
+        zchecks=zchecks,
+        num_cycles=num_cycles,
+        noise=noise_params,
+        hx=hx,
+        hz=hz,
+        lz=lz,
     )
 
     return {
@@ -399,6 +412,11 @@ def build_decoder_data(
         "sX": list(sched_x),
         "sZ": list(sched_z),
         "k": k,
+        "hx": hx,
+        "hz": hz,
+        # Text is used instead of pickling a version-specific extension type.
+        "stim_circuit": str(stim_data.circuit),
+        "stim_version": __import__("stim").__version__,
     }
 
 
