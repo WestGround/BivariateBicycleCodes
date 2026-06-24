@@ -20,8 +20,9 @@ from bposd.css import css_code
 from scipy.sparse import csc_matrix, issparse
 from tqdm import tqdm
 
-from config import BBParameters, NoiseParameters, normalized_a_params, normalized_b_params
-from config import code_param, sched_x, sched_z, N_c, error_rate, noise
+from code_parameters import BBParameters, normalized_a_params, normalized_b_params
+from config import NoiseParameters
+from config import code_param, N_c, error_rate, noise
 from stim_backend import build_stim_circuit
 
 
@@ -512,7 +513,9 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     params = code_param
-    data = build_decoder_data(params, N_c, error_rate, noise, sched_x, sched_z)
+    data = build_decoder_data(
+        params, N_c, error_rate, noise, params.sched_x, params.sched_z
+    )
     n = 2 * params.ell * params.m
 
     args = parse_args()

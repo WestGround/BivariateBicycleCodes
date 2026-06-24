@@ -14,6 +14,7 @@ from ldpc import BpOsdDecoder
 from scipy.sparse import csc_matrix
 from tqdm import tqdm
 
+from code_parameters import normalized_a_params, normalized_b_params
 from config import (
     N_c,
     bp_osd,
@@ -23,11 +24,7 @@ from config import (
     error_rate,
     noise,
     online,
-    normalized_a_params,
-    normalized_b_params,
     result_dir,
-    sched_x,
-    sched_z,
 )
 from stim_backend import StimBatchSimulator, StimCircuitData, build_stim_circuit
 
@@ -57,10 +54,10 @@ def validate_pickle(raw: dict) -> None:
         "m": code_param.m,
         "a_params": list(normalized_a_params(code_param)),
         "b_params": list(normalized_b_params(code_param)),
-        "cycle_depth": len(sched_x),
+        "cycle_depth": len(code_param.sched_x),
         "error_rate": error_rate,
-        "sX": list(sched_x),
-        "sZ": list(sched_z),
+        "sX": list(code_param.sched_x),
+        "sZ": list(code_param.sched_z),
     }
     mismatches = [
         (
@@ -98,7 +95,7 @@ def find_decoder_data(directory: Path) -> Path:
     check_weight = len(normalized_a_params(code_param)) + len(normalized_b_params(code_param))
     pattern = (
         f"decoder_data_n{n}_*_p_{error_rate}_cycles_{N_c}_"
-        f"w{check_weight}_d{len(sched_x)}.pkl"
+        f"w{check_weight}_d{len(code_param.sched_x)}.pkl"
     )
     matches = sorted(directory.glob(pattern))
     if len(matches) != 1:
