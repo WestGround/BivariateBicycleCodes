@@ -1,9 +1,5 @@
 """Build the circuit-level effective noise model for a BB code.
 
-This is a compatible, faster replacement for ``old_decoder_setup.py``.  The
-pickle produced here has the same keys and uses the same named-qubit circuit
-representation expected by ``old_decoder_run.py``.
-
 The main optimization is to avoid constructing and simulating one complete
 copy of the circuit per single fault.  A Clifford circuit is linear over each
 of its X and Z components.  We therefore sweep the circuit backwards once and
@@ -24,7 +20,7 @@ from bposd.css import css_code
 from scipy.sparse import csc_matrix, issparse
 from tqdm import tqdm
 
-from config import BBParameters, NoiseParameters
+from config import BBParameters, NoiseParameters, normalized_a_params, normalized_b_params
 from config import code_param, sched_x, sched_z, N_c, error_rate, noise
 from stim_backend import build_stim_circuit
 
@@ -59,7 +55,25 @@ def shift_matrices(size: int) -> list[np.ndarray]:
     return [np.roll(identity, shift, axis=1) for shift in range(size)]
 
 
+def monomial_matrix(
+    spec: tuple[str, int],
+    *,
+    x_shifts: Sequence[np.ndarray],
+    y_shifts: Sequence[np.ndarray],
+) -> np.ndarray:
+    axis, shift = spec
+    if axis == "x":
+        return x_shifts[shift % len(x_shifts)]
+    if axis == "y":
+        return y_shifts[shift % len(y_shifts)]
+    raise AssertionError(f"Unexpected monomial axis {axis!r}")
+
+
 def build_code(params: BBParameters):
+    """ Construct PCM (hx, hz) and css_code instance from l, m and A/B terms.
+
+        Return each permutation-matrix term list and code dimension k as well.
+    """
     print(">>> Start building PCM from parameters")
     ell, m = params.ell, params.m
     i_ell = np.eye(ell, dtype=np.uint8)
@@ -67,8 +81,10 @@ def build_code(params: BBParameters):
     x = [np.kron(s, i_m) for s in shift_matrices(ell)]
     y = [np.kron(i_ell, s) for s in shift_matrices(m)]
 
-    a_terms = (x[params.a1], y[params.a2], y[params.a3])
-    b_terms = (y[params.b1], x[params.b2], x[params.b3])
+    a_specs = normalized_a_params(params)
+    b_specs = normalized_b_params(params)
+    a_terms = tuple(monomial_matrix(spec, x_shifts=x, y_shifts=y) for spec in a_specs)
+    b_terms = tuple(monomial_matrix(spec, x_shifts=x, y_shifts=y) for spec in b_specs)
     a = np.bitwise_xor.reduce(a_terms)
     b = np.bitwise_xor.reduce(b_terms)
     hx = np.hstack((a, b)).astype(np.uint8, copy=False)
@@ -80,9 +96,9 @@ def build_code(params: BBParameters):
 
     print(">>> Testing CSS code")
     code.test()
-    print(f"<<< Done ([[{n}, {k}]])")
+    print(f"<<< Done ([[{n}, {k}]], A terms={a_specs}, B terms={b_specs})")
     print("<<< Complete building PCM from parameter\n")
-    return hx, hz, code, a_terms, b_terms, k
+    return hx, hz, code, a_terms, b_terms, k, a_specs, b_specs
 
 
 def one_position(row: np.ndarray) -> int:
@@ -95,12 +111,17 @@ def one_position(row: np.ndarray) -> int:
 def build_tanner_graph(
     a_terms: Sequence[np.ndarray], b_terms: Sequence[np.ndarray]
 ) -> tuple[list[list[int]], list[list[int]]]:
-    """Return neighbor data indices in the paper's direction ordering."""
+    """ Returns the tanner graph, which is the list of list.
+        tanner_x/z[i] is the list of indexes of data qubits checked by ith x/z check. 
+    """
     print(">>> Start building tanner graph")
     n2 = a_terms[0].shape[0]
     tanner_x: list[list[int]] = []
     tanner_z: list[list[int]] = []
     for check in range(n2):
+        # oneposition(term[check]) denotes the index of 1 in each row of term(=ai or bi).
+        # Accordingly, tanner_x[i] is the list of "indexes of data qubits" checked by ith X-check.
+        # Similar for tanner_z.
         tanner_x.append(
             [one_position(term[check]) for term in a_terms]
             + [n2 + one_position(term[check]) for term in b_terms]
@@ -109,12 +130,17 @@ def build_tanner_graph(
             [one_position(term[:, check]) for term in b_terms]
             + [n2 + one_position(term[:, check]) for term in a_terms]
         )
-
     print("<<< Complete building tanner graph\n")
     return tanner_x, tanner_z
 
 
 def build_named_qubits(n2: int):
+    """ Return lists of (name, index) for X chcecks, data, Z checks,
+        as well as dict of {name: linear_index} for entire qubits.
+
+        x/zchecks, data_qubits: lists of (name, i_from_0) for each type
+        lin_order: dict of (name, lin_order)
+    """
     xchecks = [("Xcheck", i) for i in range(n2)]
     data_qubits = [("data_left", i) for i in range(n2)] + [
         ("data_right", i) for i in range(n2)
@@ -131,49 +157,105 @@ def build_cycle(
     sched_x: Sequence[int | str],
     sched_z: Sequence[int | str],
 ) -> tuple[list[Gate], dict, list, list, list]:
-    """Construct the exact named-qubit cycle used by the original scripts."""
+    """Construct one scheduled syndrome-extraction cycle.
+
+    ``sched_x`` and ``sched_z`` are explicit timestep schedules.  At each
+    timestep, the X side may be one of ``PrepX``, ``MeasX``, ``idle``, or an
+    integer Tanner-edge index.  The Z side is analogous with ``PrepZ`` and
+    ``MeasZ``.  The two schedules must have the same length; that length is
+    the circuit depth of one QEC cycle.
+    """
     print(">>> Start build scheduled syndrome extraction cycle")
+    check_weight = len(tanner_x[0])
+    if check_weight != len(tanner_z[0]):
+        raise ValueError("X and Z Tanner graph check weights differ")
+    if len(sched_x) != len(sched_z):
+        raise ValueError(
+            f"X/Z schedule depths differ: len(sched_x)={len(sched_x)}, "
+            f"len(sched_z)={len(sched_z)}"
+        )
     xchecks, data, zchecks, lin_order = build_named_qubits(n2)
     cycle: list[Gate] = []
 
-    # Round 0: prepare X checks, interact Z checks, idle unused data.
-    if sched_x[0] != "idle" or sched_z[0] == "idle":
-        raise ValueError("Invalid round-0 schedule")
-    cycle.extend(("PrepX", q) for q in xchecks)
-    used: set = set()
-    direction = int(sched_z[0])
-    for check, target in enumerate(zchecks):
-        control = data[tanner_z[check][direction]]
-        cycle.append(("CNOT", control, target))
-        used.add(control)
-    cycle.extend(("IDLE", q) for q in data if q not in used)
+    x_special = {"PrepX", "MeasX", "idle"}
+    z_special = {"PrepZ", "MeasZ", "idle"}
+    x_counts = {"PrepX": 0, "MeasX": 0}
+    z_counts = {"PrepZ": 0, "MeasZ": 0}
 
-    # Rounds 1--5: both check types interact with data.
-    for t in range(1, 6):
-        if sched_x[t] == "idle" or sched_z[t] == "idle":
-            raise ValueError(f"Invalid schedule in round {t}")
-        dx, dz = int(sched_x[t]), int(sched_z[t])
-        for check, control in enumerate(xchecks):
-            cycle.append(("CNOT", control, data[tanner_x[check][dx]]))
-        for check, target in enumerate(zchecks):
-            cycle.append(("CNOT", data[tanner_z[check][dz]], target))
+    def normalize_op(op: int | str, allowed: set[str], side: str, t: int) -> int | str:
+        if isinstance(op, str):
+            value = op.strip()
+            if value not in allowed:
+                raise ValueError(f"Invalid {side} schedule op {op!r} at timestep {t}")
+            return value
+        direction = int(op)
+        if not 0 <= direction < check_weight:
+            raise ValueError(
+                f"{side} CNOT direction {direction} at timestep {t} is outside "
+                f"[0, {check_weight})"
+            )
+        return direction
 
-    # Round 6: measure Z checks, interact X checks, idle unused data.
-    if sched_x[6] == "idle" or sched_z[6] != "idle":
-        raise ValueError("Invalid round-6 schedule")
-    cycle.extend(("MeasZ", q) for q in zchecks)
-    used.clear()
-    direction = int(sched_x[6])
-    for check, control in enumerate(xchecks):
-        target = data[tanner_x[check][direction]]
-        cycle.append(("CNOT", control, target))
-        used.add(target)
-    cycle.extend(("IDLE", q) for q in data if q not in used)
+    for timestep, (x_op_raw, z_op_raw) in enumerate(zip(sched_x, sched_z)):
+        x_op = normalize_op(x_op_raw, x_special, "X", timestep)
+        z_op = normalize_op(z_op_raw, z_special, "Z", timestep)
+        data_used: set = set()
+        timestep_ops: list[Gate] = []
 
-    # Round 7: data idle, measure X checks, prepare Z checks.
-    cycle.extend(("IDLE", q) for q in data)
-    cycle.extend(("MeasX", q) for q in xchecks)
-    cycle.extend(("PrepZ", q) for q in zchecks)
+        # Resets and measurements are scheduled explicitly.
+        if x_op == "PrepX":
+            timestep_ops.extend(("PrepX", q) for q in xchecks)
+            x_counts["PrepX"] += 1
+        elif x_op == "MeasX":
+            timestep_ops.extend(("MeasX", q) for q in xchecks)
+            x_counts["MeasX"] += 1
+
+        if z_op == "PrepZ":
+            timestep_ops.extend(("PrepZ", q) for q in zchecks)
+            z_counts["PrepZ"] += 1
+        elif z_op == "MeasZ":
+            timestep_ops.extend(("MeasZ", q) for q in zchecks)
+            z_counts["MeasZ"] += 1
+
+        # CNOTs in the same timestep must be a parallel layer.  In particular,
+        # an X-check and a Z-check cannot touch the same data qubit here.
+        if isinstance(x_op, int):
+            for check, control in enumerate(xchecks):
+                target = data[tanner_x[check][x_op]]
+                if target in data_used:
+                    raise ValueError(
+                        f"Non-parallel X CNOT layer at timestep {timestep}: "
+                        f"data qubit {target} is reused"
+                    )
+                data_used.add(target)
+                timestep_ops.append(("CNOT", control, target))
+        if isinstance(z_op, int):
+            for check, target in enumerate(zchecks):
+                control = data[tanner_z[check][z_op]]
+                if control in data_used:
+                    raise ValueError(
+                        f"Non-parallel X/Z CNOT schedule at timestep {timestep}: "
+                        f"data qubit {control} is reused"
+                    )
+                data_used.add(control)
+                timestep_ops.append(("CNOT", control, target))
+
+        timestep_ops.extend(("IDLE", q) for q in data if q not in data_used)
+        cycle.extend(timestep_ops)
+        cycle.append(("TICK",))
+
+    expected_counts = {
+        "PrepX": x_counts["PrepX"],
+        "MeasX": x_counts["MeasX"],
+        "PrepZ": z_counts["PrepZ"],
+        "MeasZ": z_counts["MeasZ"],
+    }
+    bad = {name: count for name, count in expected_counts.items() if count != 1}
+    if bad:
+        raise ValueError(
+            "Each QEC cycle must contain exactly one PrepX, MeasX, PrepZ, and "
+            f"MeasZ layer; got {expected_counts}"
+        )
     print("<<< Complete build scheduled syndrome extraction cycle\n")
     return cycle, lin_order, data, xchecks, zchecks
 
@@ -347,7 +429,7 @@ def build_decoder_data(
     sched_x: Sequence[int | str],
     sched_z: Sequence[int | str],
 ) -> dict:
-    hx, hz, code, a_terms, b_terms, k = build_code(params)
+    hx, hz, code, a_terms, b_terms, k, a_specs, b_specs = build_code(params)
     n2 = params.ell * params.m
     tanner_x, tanner_z = build_tanner_graph(a_terms, b_terms)
     cycle, lin_order, data, xchecks, zchecks = build_cycle(
@@ -357,6 +439,9 @@ def build_decoder_data(
     data_indices = np.fromiter((lin_order[q] for q in data), dtype=np.int64)
     lx = np.asarray(code.lx.toarray() if issparse(code.lx) else code.lx, dtype=np.uint8)
     lz = np.asarray(code.lz.toarray() if issparse(code.lz) else code.lz, dtype=np.uint8)
+    # cycle: List of ('CNOT', ('data_right', 18), ('Zcheck', 0))
+    # cycle_i: List of ('CNOT', 90, 108) (=('CNOT', 36+36+18, 36+36+36+0))
+    # lx, lz: numpy.ndarray type
 
     hx_aug, hdec_x, prob_x, first_x = effective_noise_model(
         "X", cycle_i, num_cycles, n2, lz, data_indices, noise_params
@@ -396,12 +481,11 @@ def build_decoder_data(
         "first_logical_rowX": first_x,
         "ell": params.ell,
         "m": params.m,
-        "a1": params.a1,
-        "a2": params.a2,
-        "a3": params.a3,
-        "b1": params.b1,
-        "b2": params.b2,
-        "b3": params.b3,
+        "format_version": 2,
+        "a_params": list(a_specs),
+        "b_params": list(b_specs),
+        "check_weight": len(a_terms) + len(b_terms),
+        "cycle_depth": len(sched_x),
         "error_rate": nominal_error_rate,
         "noise": {
             "init": noise_params.init,
@@ -432,8 +516,9 @@ def main() -> None:
     n = 2 * params.ell * params.m
 
     args = parse_args()
+    check_weight = data["check_weight"]
     output = args.output or Path("TMP") / (
-        f"mydata_{n}_{data['k']}_p_{error_rate}_cycles_{N_c}"
+        f"decoder_data_n{n}_k{data['k']}_p_{error_rate}_cycles_{N_c}_w{check_weight}_d{data['cycle_depth']}.pkl"
     )
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("wb") as stream:

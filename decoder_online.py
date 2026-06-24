@@ -23,6 +23,8 @@ from config import (
     error_rate,
     noise,
     online,
+    normalized_a_params,
+    normalized_b_params,
     result_dir,
     sched_x,
     sched_z,
@@ -45,24 +47,34 @@ class DecoderData:
 
 
 def validate_pickle(raw: dict) -> None:
+    def comparable_params(specs):
+        return [tuple(item) if isinstance(item, (list, tuple)) else item for item in specs]
+
     expected = {
+        "format_version": 2,
         "num_cycles": N_c,
         "ell": code_param.ell,
         "m": code_param.m,
-        "a1": code_param.a1,
-        "a2": code_param.a2,
-        "a3": code_param.a3,
-        "b1": code_param.b1,
-        "b2": code_param.b2,
-        "b3": code_param.b3,
+        "a_params": list(normalized_a_params(code_param)),
+        "b_params": list(normalized_b_params(code_param)),
+        "cycle_depth": len(sched_x),
         "error_rate": error_rate,
         "sX": list(sched_x),
         "sZ": list(sched_z),
     }
     mismatches = [
-        f"{key}: file={raw.get(key)!r}, config={value!r}"
+        (
+            f"{key}: file="
+            f"{comparable_params(raw.get(key, [])) if key in {'a_params', 'b_params'} else raw.get(key)!r}, "
+            f"config={value!r}"
+        )
         for key, value in expected.items()
-        if raw.get(key) != value
+        if (
+            comparable_params(raw.get(key, []))
+            if key in {"a_params", "b_params"}
+            else raw.get(key)
+        )
+        != value
     ]
     expected_noise = {
         "init": noise.init,
@@ -83,7 +95,11 @@ def validate_pickle(raw: dict) -> None:
 
 def find_decoder_data(directory: Path) -> Path:
     n = 2 * code_param.ell * code_param.m
-    pattern = f"mydata_{n}_*_p_{error_rate}_cycles_{N_c}"
+    check_weight = len(normalized_a_params(code_param)) + len(normalized_b_params(code_param))
+    pattern = (
+        f"decoder_data_n{n}_*_p_{error_rate}_cycles_{N_c}_"
+        f"w{check_weight}_d{len(sched_x)}.pkl"
+    )
     matches = sorted(directory.glob(pattern))
     if len(matches) != 1:
         raise FileNotFoundError(
@@ -241,15 +257,19 @@ def main() -> None:
     trials = args.trials if args.trials is not None else online.num_trials
     batch_size = args.batch_size if args.batch_size is not None else online.batch_size
     seed = args.seed if args.seed is not None else online.random_seed
+
+    # Main Monte-Carlo execution
     start = time.perf_counter()
     failures = run_monte_carlo(data, trials, batch_size, seed)
     elapsed = time.perf_counter() - start
+
     logical_error_rate = failures / (trials * N_c)
     print(
         f"p={error_rate}\tcycles={N_c}\ttrials={trials}\tfailures={failures}\t"
         f"logical_error_rate={logical_error_rate:.8e}\telapsed={elapsed:.1f}s"
     )
 
+    # Write result
     n = 2 * code_param.ell * code_param.m
     output = args.output or result_dir / f"code_{n}_{data.k}_{code_distance}.tsv"
     output.parent.mkdir(parents=True, exist_ok=True)

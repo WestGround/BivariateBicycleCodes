@@ -28,18 +28,6 @@ def _targets(gates: Sequence[Gate], lin_order: dict) -> list[int]:
     return [lin_order[gate[1]] for gate in gates]
 
 
-def _take(
-    cycle: Sequence[Gate], position: int, count: int, kind: str
-) -> tuple[list[Gate], int]:
-    gates = list(cycle[position : position + count])
-    if len(gates) != count or any(gate[0] != kind for gate in gates):
-        actual = tuple(gate[0] for gate in gates[:3])
-        raise ValueError(
-            f"Unexpected cycle layout at {position}: expected {kind}, got {actual}"
-        )
-    return gates, position + count
-
-
 def _append_cnot_layer(
     out: stim.Circuit,
     gates: Sequence[Gate],
@@ -71,15 +59,21 @@ def _append_idle_noise(
         out.append("DEPOLARIZE1", _targets(gates, lin_order), probability)
 
 
-def _append_detectors(out: stim.Circuit, n2: int, cycle_index: int) -> None:
-    """Append current syndrome xor previous syndrome, in check-index order."""
-    for check in range(n2):
-        current = stim.target_rec(check - n2)
-        if cycle_index == 0:
-            out.append("DETECTOR", [current])
-        else:
-            previous = stim.target_rec(check - 3 * n2)
-            out.append("DETECTOR", [current, previous])
+def _append_detector_block(
+    out: stim.Circuit,
+    *,
+    current: Sequence[int],
+    previous: Sequence[int | None],
+    measurement_count: int,
+) -> None:
+    """Append detectors for one check type using absolute measurement indices."""
+    if len(current) != len(previous):
+        raise ValueError("Current and previous measurement blocks differ in length")
+    for now, before in zip(current, previous):
+        targets = [stim.target_rec(now - measurement_count)]
+        if before is not None:
+            targets.append(stim.target_rec(before - measurement_count))
+        out.append("DETECTOR", targets)
 
 
 def _encoded_state_prep(
@@ -138,7 +132,7 @@ def build_stim_circuit(
     hz: np.ndarray | None = None,
     lz: np.ndarray | None = None,
 ) -> StimCircuitData:
-    """Translate the legacy scheduled cycle into a detector-annotated circuit.
+    """Translate the scheduled cycle into a detector-annotated Stim circuit.
 
     The first ``num_cycles`` rounds are noisy and two trailing rounds are
     noiseless, matching the original decoder.  Detector order per cycle is
@@ -149,29 +143,20 @@ def build_stim_circuit(
     if len(zchecks) != n2 or len(data_qubits) != 2 * n2:
         raise ValueError("Unexpected BB qubit partition")
 
-    position = 0
-    prep_x, position = _take(cycle, position, n2, "PrepX")
-    round0, position = _take(cycle, position, n2, "CNOT")
-    idle0, position = _take(cycle, position, n2, "IDLE")
-    middle: list[list[Gate]] = []
-    for _ in range(5):
-        xgates, position = _take(cycle, position, n2, "CNOT")
-        zgates, position = _take(cycle, position, n2, "CNOT")
-        middle.append(xgates + zgates)
-    meas_z, position = _take(cycle, position, n2, "MeasZ")
-    round6, position = _take(cycle, position, n2, "CNOT")
-    idle6, position = _take(cycle, position, n2, "IDLE")
-    idle7, position = _take(cycle, position, 2 * n2, "IDLE")
-    meas_x, position = _take(cycle, position, n2, "MeasX")
-    prep_z, position = _take(cycle, position, n2, "PrepZ")
-    if position != len(cycle):
-        raise ValueError(f"Cycle has {len(cycle) - position} unparsed operations")
+    layers: list[list[Gate]] = []
+    layer: list[Gate] = []
+    for gate in cycle:
+        if gate[0] == "TICK":
+            layers.append(layer)
+            layer = []
+        else:
+            layer.append(gate)
+    if layer:
+        raise ValueError("Scheduled cycle must end with TICK")
+    if not layers:
+        raise ValueError("Scheduled cycle contains no timesteps")
 
     data_indices = np.fromiter((lin_order[q] for q in data_qubits), dtype=np.intp)
-    prep_x_q = _targets(prep_x, lin_order)
-    prep_z_q = _targets(prep_z, lin_order)
-    meas_z_q = _targets(meas_z, lin_order)
-    meas_x_q = _targets(meas_x, lin_order)
     out = stim.Circuit()
     supplied = (hx is not None, hz is not None, lz is not None)
     if any(supplied) and not all(supplied):
@@ -181,6 +166,10 @@ def build_stim_circuit(
         out += _encoded_state_prep(hx, hz, lz, data_indices)
         out.append("TICK")
 
+    measurement_count = 0
+    previous_z: list[int | None] = [None] * n2
+    previous_x: list[int | None] = [None] * n2
+
     for cycle_index in range(num_cycles + 2):
         noisy = cycle_index < num_cycles
         init_p = noise.init if noisy else 0.0
@@ -188,34 +177,78 @@ def build_stim_circuit(
         cnot_p = noise.cnot if noisy else 0.0
         meas_p = noise.meas if noisy else 0.0
 
-        # t=0: X-check preparation, Z-check interaction, unused data idles.
-        out.append("RX", prep_x_q)
-        if init_p:
-            out.append("Z_ERROR", prep_x_q, init_p)
-        _append_cnot_layer(out, round0, lin_order, cnot_p)
-        _append_idle_noise(out, idle0, lin_order, idle_p)
-        out.append("TICK")
+        current_z: list[int] | None = None
+        current_x: list[int] | None = None
 
-        # t=1..5: disjoint X- and Z-check interactions.
-        for layer in middle:
-            _append_cnot_layer(out, layer, lin_order, cnot_p)
+        for timestep, layer in enumerate(layers):
+            by_kind: dict[str, list[Gate]] = {
+                "PrepX": [],
+                "PrepZ": [],
+                "MeasZ": [],
+                "MeasX": [],
+                "CNOT": [],
+                "IDLE": [],
+            }
+            for gate in layer:
+                if gate[0] not in by_kind:
+                    raise ValueError(f"Unsupported scheduled gate {gate[0]!r}")
+                by_kind[gate[0]].append(gate)
+
+            if by_kind["PrepX"]:
+                targets = _targets(by_kind["PrepX"], lin_order)
+                out.append("RX", targets)
+                if init_p:
+                    out.append("Z_ERROR", targets, init_p)
+            if by_kind["PrepZ"]:
+                targets = _targets(by_kind["PrepZ"], lin_order)
+                out.append("R", targets)
+                if init_p:
+                    out.append("X_ERROR", targets, init_p)
+            if by_kind["MeasZ"]:
+                if current_z is not None:
+                    raise ValueError("Each cycle may contain only one MeasZ layer")
+                if len(by_kind["MeasZ"]) != n2:
+                    raise ValueError(
+                        f"MeasZ timestep {timestep} has {len(by_kind['MeasZ'])} "
+                        f"measurements, expected {n2}"
+                    )
+                out.append("M", _targets(by_kind["MeasZ"], lin_order), meas_p)
+                current_z = list(range(measurement_count, measurement_count + n2))
+                measurement_count += n2
+            if by_kind["MeasX"]:
+                if current_x is not None:
+                    raise ValueError("Each cycle may contain only one MeasX layer")
+                if len(by_kind["MeasX"]) != n2:
+                    raise ValueError(
+                        f"MeasX timestep {timestep} has {len(by_kind['MeasX'])} "
+                        f"measurements, expected {n2}"
+                    )
+                out.append("MX", _targets(by_kind["MeasX"], lin_order), meas_p)
+                current_x = list(range(measurement_count, measurement_count + n2))
+                measurement_count += n2
+            if by_kind["CNOT"]:
+                _append_cnot_layer(out, by_kind["CNOT"], lin_order, cnot_p)
+            _append_idle_noise(out, by_kind["IDLE"], lin_order, idle_p)
             out.append("TICK")
 
-        # t=6: Z-check measurement and final X-check interaction.
-        out.append("M", meas_z_q, meas_p)
-        _append_detectors(out, n2, cycle_index)
-        _append_cnot_layer(out, round6, lin_order, cnot_p)
-        _append_idle_noise(out, idle6, lin_order, idle_p)
-        out.append("TICK")
-
-        # t=7: data idles, X checks are measured, Z checks are prepared.
-        _append_idle_noise(out, idle7, lin_order, idle_p)
-        out.append("MX", meas_x_q, meas_p)
-        _append_detectors(out, n2, cycle_index)
-        out.append("R", prep_z_q)
-        if init_p:
-            out.append("X_ERROR", prep_z_q, init_p)
-        out.append("TICK")
+        if current_z is None or current_x is None:
+            raise ValueError("Each cycle must contain one MeasZ layer and one MeasX layer")
+        # Keep detector order independent of the measurement timesteps:
+        # Z-check detectors first, then X-check detectors.
+        _append_detector_block(
+            out,
+            current=current_z,
+            previous=previous_z,
+            measurement_count=measurement_count,
+        )
+        _append_detector_block(
+            out,
+            current=current_x,
+            previous=previous_x,
+            measurement_count=measurement_count,
+        )
+        previous_z = list(current_z)
+        previous_x = list(current_x)
 
     expected_detectors = 2 * n2 * (num_cycles + 2)
     if out.num_detectors != expected_detectors:
