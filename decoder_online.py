@@ -10,22 +10,24 @@ from pathlib import Path
 
 import numpy as np
 import stim
-from ldpc import BpOsdDecoder
 from scipy.sparse import csc_matrix
 from tqdm import tqdm
 
 from code_parameters import normalized_a_params, normalized_b_params
 from config import (
     N_c,
+    beam_search,
     bp_osd,
     code_distance,
     code_param,
     decoder_data_dir,
+    decoder_backend,
     error_rate,
     noise,
     online,
     result_dir,
 )
+from decoder_backends import DecoderBuildContext, make_recovery_decoder
 from stim_backend import StimBatchSimulator, StimCircuitData, build_stim_circuit
 
 
@@ -158,21 +160,6 @@ def load_decoder_data(path: Path) -> DecoderData:
     return data
 
 
-def make_decoder(pcm: csc_matrix, probabilities: np.ndarray) -> BpOsdDecoder:
-    return BpOsdDecoder(
-        pcm,
-        # ldpc 2.4.1's Cython constructor requires list despite its ndarray docs.
-        error_channel=probabilities.tolist(),
-        max_iter=bp_osd.max_iter,
-        bp_method=bp_osd.bp_method,
-        ms_scaling_factor=bp_osd.ms_scaling_factor,
-        schedule=bp_osd.schedule,
-        omp_thread_count=bp_osd.omp_thread_count,
-        osd_method=bp_osd.osd_method,
-        osd_order=bp_osd.osd_order,
-    )
-
-
 def logical_from_recovery(
     logical_map: csc_matrix, recovery: np.ndarray
 ) -> np.ndarray:
@@ -184,12 +171,23 @@ def run_monte_carlo(
     num_trials: int,
     batch_size: int,
     seed: int | None,
+    backend_name: str,
 ) -> int:
     if num_trials <= 0 or batch_size <= 0:
         raise ValueError("num_trials and batch_size must be positive")
-    print(">>> Start Stim Monte Carlo")
-    decoder_x = make_decoder(data.hdec_x, data.prob_x)
-    decoder_z = make_decoder(data.hdec_z, data.prob_z)
+    print(f">>> Start Stim Monte Carlo ({backend_name})")
+    decoder_x = make_recovery_decoder(
+        backend_name,
+        DecoderBuildContext(data.hdec_x, data.prob_x, "X"),
+        bp_osd=bp_osd,
+        beam_search=beam_search,
+    )
+    decoder_z = make_recovery_decoder(
+        backend_name,
+        DecoderBuildContext(data.hdec_z, data.prob_z, "Z"),
+        bp_osd=bp_osd,
+        beam_search=beam_search,
+    )
     simulator = StimBatchSimulator(
         data.stim_data, batch_size=batch_size, seed=seed
     )
@@ -233,6 +231,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--trials", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument(
+        "--decoder",
+        choices=("bp_osd", "beam_search"),
+        default=None,
+        help="override config.decoder_backend",
+    )
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument(
         "--write-stim-circuit",
@@ -254,15 +258,17 @@ def main() -> None:
     trials = args.trials if args.trials is not None else online.num_trials
     batch_size = args.batch_size if args.batch_size is not None else online.batch_size
     seed = args.seed if args.seed is not None else online.random_seed
+    backend_name = args.decoder if args.decoder is not None else decoder_backend
 
     # Main Monte-Carlo execution
     start = time.perf_counter()
-    failures = run_monte_carlo(data, trials, batch_size, seed)
+    failures = run_monte_carlo(data, trials, batch_size, seed, backend_name)
     elapsed = time.perf_counter() - start
 
     logical_error_rate = failures / (trials * N_c)
     print(
-        f"p={error_rate}\tcycles={N_c}\ttrials={trials}\tfailures={failures}\t"
+        f"decoder={backend_name}\tp={error_rate}\tcycles={N_c}\t"
+        f"trials={trials}\tfailures={failures}\t"
         f"logical_error_rate={logical_error_rate:.8e}\telapsed={elapsed:.1f}s"
     )
 
@@ -274,11 +280,11 @@ def main() -> None:
     with output.open("a", encoding="utf-8") as stream:
         if new_file:
             stream.write(
-                "error_rate\tcycles\ttrials\tfailures\t"
+                "decoder\terror_rate\tcycles\ttrials\tfailures\t"
                 "logical_error_rate\telapsed_seconds\n"
             )
         stream.write(
-            f"{error_rate}\t{N_c}\t{trials}\t{failures}\t"
+            f"{backend_name}\t{error_rate}\t{N_c}\t{trials}\t{failures}\t"
             f"{logical_error_rate:.12g}\t{elapsed:.6f}\n"
         )
     print(f"Result appended to {output}")

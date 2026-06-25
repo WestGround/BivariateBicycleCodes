@@ -28,6 +28,15 @@ class BpOsdParameters:
 
 
 @dataclass(frozen=True)
+class BeamSearchParameters:
+    max_rounds: int
+    beam_width: int
+    num_results: int
+    initial_iters: int
+    iters_per_round: int
+
+
+@dataclass(frozen=True)
 class OnlineParameters:
     num_trials: int
     batch_size: int
@@ -44,6 +53,10 @@ noise = NoiseParameters.depolarizing(error_rate)
 code_param = GrossParam
 code_distance = 12
 
+# Select the recovery decoder used by decoder_online.py.
+# Supported values: "bp_osd", "beam_search".
+decoder_backend = "bp_osd"
+
 # BP-OSD parameters use the ldpc v2 spelling.
 bp_osd = BpOsdParameters(
     bp_method="minimum_sum",
@@ -53,6 +66,14 @@ bp_osd = BpOsdParameters(
     omp_thread_count=1,
     osd_method="osd_cs",
     osd_order=10,
+)
+
+beam_search = BeamSearchParameters(
+    max_rounds=10,
+    beam_width=8,
+    num_results=1,
+    initial_iters=30,
+    iters_per_round=20,
 )
 
 online = OnlineParameters(

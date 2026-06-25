@@ -27,20 +27,46 @@ distance_test.py calculates the code distance by solving an integer linear progr
 
 The maintained implementation is split into:
 
-* `config.py`: code, circuit-noise, BP-OSD, and Monte Carlo parameters.
+* `code_parameters.py`: BB polynomial terms and the code-dependent
+  syndrome-extraction schedule.
+* `config.py`: selected code, circuit-noise, decoder-backend, and Monte Carlo
+  parameters.
 * `decoder_offline.py`: constructs the effective BP-OSD noise model and saves a
   detector-annotated Stim circuit in the decoder pickle.
 * `stim_backend.py`: translates the scheduled BB syndrome-extraction cycle into
   Stim operations (`TICK`, noise channels, and `DETECTOR`) and samples it using
   `stim.FlipSimulator`.
+* `decoder_backends.py`: small decoder interface and factory for recovery
+  decoders such as BP-OSD and beam search.
 * `decoder_online.py`: obtains detector events and final X/Z Pauli frames from
-  Stim, then performs BP-OSD decoding using `ldpc.BpOsdDecoder`.
+  Stim, then decodes with the selected backend.
 
 Run the offline step once and then run Monte Carlo sampling:
 
 ```powershell
 python -B decoder_offline.py
 python -B decoder_online.py
+```
+
+Select the online decoder in `config.py`:
+
+```python
+decoder_backend = "bp_osd"       # or "beam_search"
+```
+
+or override it on the command line:
+
+```powershell
+python -B decoder_online.py --decoder beam_search
+```
+
+The beam-search decoder source is vendored under
+`vendor/BeamSearchDecoder/decoder`.  Before using `decoder_backend =
+"beam_search"`, build its Cython extension once:
+
+```powershell
+cd vendor/BeamSearchDecoder/decoder
+python setup.py build_ext --inplace
 ```
 
 The generated Stim circuit can be inspected independently:
