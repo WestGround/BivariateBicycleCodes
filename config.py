@@ -55,7 +55,7 @@ code_distance = 12
 
 # Select the recovery decoder used by decoder_online.py.
 # Supported values: "bp_osd", "beam_search".
-decoder_backend = "bp_osd"
+decoder_backend = "beam_search"
 
 # BP-OSD parameters use the ldpc v2 spelling.
 bp_osd = BpOsdParameters(
@@ -69,16 +69,16 @@ bp_osd = BpOsdParameters(
 )
 
 beam_search = BeamSearchParameters(
-    max_rounds=10,
-    beam_width=8,
+    max_rounds=20,
+    beam_width=64,
     num_results=1,
-    initial_iters=30,
-    iters_per_round=20,
+    initial_iters=40,
+    iters_per_round=30,
 )
 
 online = OnlineParameters(
-    num_trials=10_000,
-    batch_size=2_048,
+    num_trials=500_000,
+    batch_size=4_096,
     random_seed=None,
     progress=True,
 )
